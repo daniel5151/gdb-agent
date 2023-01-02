@@ -8,7 +8,12 @@ repository = "https://github.com/khuey/gdb-agent"
 description = "Gdb agent bytecode handling utilities."
 keywords = ["gdb", "debugger"]
 
+[features]
+default = ["std"]
+
+std = ["alloc", "managed/std"]
+alloc = ["managed/alloc"]
+
 [dependencies]
-byteorder = "1.1.0"
-error-chain = "0.12"
+managed = { version = "0.8.0", default-features = false }
 num_enum = "0.5"

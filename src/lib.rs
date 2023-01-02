@@ -1,76 +1,78 @@
+#![allow(clippy::bool_to_int_with_if)]
 #![deny(missing_debug_implementations)]
-use std::convert::TryFrom;
-use std::io::{self, Cursor, Read};
+#![warn(missing_docs)]
+#![cfg_attr(not(feature = "alloc"), no_std)]
 
-use byteorder::{BigEndian, ReadBytesExt};
-use error_chain::*;
+//! TODO: crate docs
+
+use core::convert::TryFrom;
+use core::convert::TryInto;
+use managed::ManagedSlice;
 use num_enum::TryFromPrimitive;
 
-#[allow(deprecated)]
-mod error {
-    use super::*;
+type Result<T> = core::result::Result<T, AgentError>;
 
-    error_chain! {
-        foreign_links {
-            Io(::std::io::Error);
-        }
+/// Errors which may occur during gdb agent bytecode evaluation
+#[derive(Debug)]
+pub enum AgentError {
+    /// Evaluating opcode at `pos` resulted in a division by zero
+    DivideByZero(Opcode, u64),
+    /// No value on the evaluation stack when evaluating opcode at `pos`
+    NoValueOnStack(Opcode, u64),
+    /// The index is not a valid index for the evaluation stack when evaluating opcode at `pos`
+    PickIndexOutOfRange(Opcode, u64, usize),
+    /// Unrecognized opcode value at `pos`
+    UnrecognizedOpcode(u8, u64),
+    /// Unexpected end of bytecode stream
+    UnexpectedEof,
+    /// Bytecode stack overflow
+    StackOverflow,
+}
 
-        errors {
-            DivideByZero(o: Opcode, pos: u64) {
-                description("Division by zero")
-                    display("Evaluating the opcode {:?} at {} resulted in a division by zero", o, pos)
-            }
-            NoValueOnStack(o: Opcode, pos: u64) {
-                description("Evaluation stack is empty")
-                    display("There is no value on the evaluation stack to use when evaluating opcode {:?} at {}", o, pos)
-            }
-            PickIndexOutOfRange(o: Opcode, pos: u64, index: usize) {
-                description("Pick index is out of range")
-                    display("The index {} is not a valid index for the evaluation stack when evaluating opcode {:?} at {}", index, o, pos)
-            }
-            UnrecognizedOpcode(o: u8, pos: u64) {
-                description("Unrecognized opcode")
-                    display("Opcode value '{}' is unknown at {}", o, pos)
-            }
+impl core::fmt::Display for AgentError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            AgentError::DivideByZero(o, pos) => write!(f, "Evaluating the opcode {:?} at {} resulted in a division by zero", o, pos),
+            AgentError::NoValueOnStack(o, pos) => write!(f, "No value on the evaluation stack when evaluating opcode {:?} at {}", o, pos),
+            AgentError::PickIndexOutOfRange(o, pos, index) => write!(f, "The index {} is not a valid index for the evaluation stack when evaluating opcode {:?} at {}", index, o, pos),
+            AgentError::UnrecognizedOpcode(o, pos) => write!(f, "Opcode value '{}' is unknown at {}", o, pos),
+            AgentError::UnexpectedEof => write!(f, "Unexpected end of bytecode"),
+            AgentError::StackOverflow => write!(f, "Bytecode stack overflow"),
         }
     }
 }
 
-pub use error::*;
+#[cfg(feature = "std")]
+impl std::error::Error for AgentError {}
 
 trait ReadBigEndian: Sized {
-    fn read_big_endian<R: Read>(r: &mut R) -> io::Result<Self>;
+    fn read_big_endian(b: &[u8], pos: &mut u64) -> Option<Self>;
 }
 
-impl ReadBigEndian for u8 {
-    fn read_big_endian<R: Read>(r: &mut R) -> io::Result<Self> {
-        r.read_u8()
-    }
+macro_rules! impl_read_big_endian {
+    ($n:ty) => {
+        impl ReadBigEndian for $n {
+            fn read_big_endian(b: &[u8], pos: &mut u64) -> Option<Self> {
+                const NUM_SIZE: usize = core::mem::size_of::<$n>();
+                let n = b.get((*pos as usize)..((*pos as usize) + NUM_SIZE))?;
+                *pos += NUM_SIZE as u64;
+                Some(<$n>::from_be_bytes(n.try_into().unwrap()))
+            }
+        }
+    };
 }
 
-impl ReadBigEndian for u16 {
-    fn read_big_endian<R: Read>(r: &mut R) -> io::Result<Self> {
-        r.read_u16::<BigEndian>()
-    }
-}
-
-impl ReadBigEndian for u32 {
-    fn read_big_endian<R: Read>(r: &mut R) -> io::Result<Self> {
-        r.read_u32::<BigEndian>()
-    }
-}
-
-impl ReadBigEndian for u64 {
-    fn read_big_endian<R: Read>(r: &mut R) -> io::Result<Self> {
-        r.read_u64::<BigEndian>()
-    }
-}
+impl_read_big_endian!(u8);
+impl_read_big_endian!(u16);
+impl_read_big_endian!(u32);
+impl_read_big_endian!(u64);
 
 /// A value produced by a gdb agent expression.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Value(pub i64);
 
 /// A gdb agent expression opcode.
+#[allow(missing_docs)] // self explanatory variants
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, TryFromPrimitive)]
 #[repr(u8)]
 pub enum Opcode {
@@ -135,17 +137,29 @@ enum State {
 }
 
 #[derive(Debug)]
-struct StateMachine<'bytecode> {
-    bytecode: Cursor<&'bytecode [u8]>,
-    stack: Vec<Value>,
+struct StateMachine<'bc, 's> {
+    bytecode: &'bc [u8],
+    pos: u64,
+    stack: ManagedVec<'s, Value>,
     error: bool,
 }
 
-impl<'bytecode> StateMachine<'bytecode> {
-    fn new(bytecode: &'bytecode [u8]) -> StateMachine<'bytecode> {
+impl<'bc, 's> StateMachine<'bc, 's> {
+    #[cfg(feature = "alloc")]
+    fn new(bytecode: &'bc [u8]) -> StateMachine<'bc, 'static> {
         StateMachine {
-            bytecode: Cursor::new(bytecode),
-            stack: Vec::new(),
+            bytecode,
+            pos: 0,
+            stack: ManagedVec::new(ManagedSlice::Owned(Vec::new())),
+            error: false,
+        }
+    }
+
+    fn new_fixed(bytecode: &'bc [u8], stack: &'s mut [Value]) -> StateMachine<'bc, 's> {
+        StateMachine {
+            bytecode,
+            pos: 0,
+            stack: ManagedVec::new(ManagedSlice::Borrowed(stack)),
             error: false,
         }
     }
@@ -156,7 +170,7 @@ impl<'bytecode> StateMachine<'bytecode> {
         let ret = self.stack.pop();
         ret.ok_or_else(|| {
             self.error = true;
-            ErrorKind::NoValueOnStack(o, pos).into()
+            AgentError::NoValueOnStack(o, pos)
         })
     }
 
@@ -170,22 +184,22 @@ impl<'bytecode> StateMachine<'bytecode> {
     }
 
     /// Fetch a value of the specified size from the bytecode stream.
-    fn fetch<T>(&mut self) -> io::Result<T>
+    fn fetch<T>(&mut self) -> Result<T>
     where
         T: ReadBigEndian,
     {
-        match T::read_big_endian(&mut self.bytecode) {
-            Ok(t) => Ok(t),
-            Err(e) => {
+        match T::read_big_endian(self.bytecode, &mut self.pos) {
+            Some(t) => Ok(t),
+            None => {
                 self.error = true;
-                Err(e)
+                Err(AgentError::UnexpectedEof)
             }
         }
     }
 
     /// Add a value to the stack.
     fn push(&mut self, v: Value) -> Result<()> {
-        self.stack.push(v);
+        self.stack.push(v).map_err(|_| AgentError::StackOverflow)?;
         Ok(())
     }
 
@@ -195,26 +209,25 @@ impl<'bytecode> StateMachine<'bytecode> {
         let stack_length = self.stack.len();
         let index = stack_length
             .checked_sub(1 + i)
-            .ok_or_else::<Error, _>(|| ErrorKind::PickIndexOutOfRange(o, pos, i).into())?;
-        let v = self.stack.get(index).unwrap().clone();
-        self.push(v)
+            .ok_or(AgentError::PickIndexOutOfRange(o, pos, i))?;
+        let v = self.stack.get(index).unwrap();
+        self.push(*v)
     }
 
     /// Ensure the value is nonzero.
     fn nonzero(&mut self, v: Value, o: Opcode, pos: u64) -> Result<Value> {
         if v.0 == 0 {
-            return Err(ErrorKind::DivideByZero(o, pos).into());
+            return Err(AgentError::DivideByZero(o, pos));
         }
 
         Ok(v)
     }
 
     fn step(&mut self) -> Result<State> {
-        let pos = self.bytecode.position();
+        let pos = self.pos;
         let op = {
             let op_value: u8 = self.fetch()?;
-            Opcode::try_from(op_value)
-                .map_err::<Error, _>(|_| ErrorKind::UnrecognizedOpcode(op_value, pos).into())?
+            Opcode::try_from(op_value).map_err(|_| AgentError::UnrecognizedOpcode(op_value, pos))?
         };
 
         match op {
@@ -352,12 +365,12 @@ impl<'bytecode> StateMachine<'bytecode> {
             Opcode::OpIfGoto => {
                 let offset = self.fetch::<u16>()? as u64;
                 if self.pop(op, pos)?.0 != 0 {
-                    self.bytecode.set_position(offset);
+                    self.pos = offset;
                 }
             }
             Opcode::OpGoto => {
                 let offset = self.fetch::<u16>()? as u64;
-                self.bytecode.set_position(offset)
+                self.pos = offset;
             }
             Opcode::OpConst8 => {
                 let value = Value(self.fetch::<u8>()? as i64);
@@ -422,63 +435,67 @@ impl<'bytecode> StateMachine<'bytecode> {
     }
 }
 
-fn evaluate_internal<'bytecode>(
-    mut state: StateMachine<'bytecode>,
-) -> Result<AgentExpressionResult<'bytecode>> {
+fn evaluate_internal<'bc, 's>(
+    mut state: StateMachine<'bc, 's>,
+) -> Result<AgentExpressionResult<'bc, 's>> {
     Ok(match state.evaluate()? {
         State::Complete(v) => AgentExpressionResult::Complete(v),
         State::NeedsRegister(r) => AgentExpressionResult::NeedsRegister {
             register: r,
-            expression: AgentExpressionNeedsRegister { state: state },
+            expression: AgentExpressionNeedsRegister { state },
         },
         State::NeedsMemory { address, size } => AgentExpressionResult::NeedsMemory {
-            address: address,
-            size: size,
-            expression: AgentExpressionNeedsMemory { state: state },
+            address,
+            size,
+            expression: AgentExpressionNeedsMemory { state },
         },
         State::Continue => unreachable!(),
     })
 }
 
+/// Evaluate an agent bytecode expression, using a pre-allocated fixed-size stack.
+pub fn evaluate_fixed_stack<'bc, 's>(
+    bytecode: &'bc [u8],
+    stack: &'s mut [Value],
+) -> Result<AgentExpressionResult<'bc, 's>> {
+    evaluate_internal(StateMachine::new_fixed(bytecode, stack))
+}
+
 /// Evaluate an agent bytecode expression.
-///
-///
-pub fn evaluate<'bytecode>(bytecode: &'bytecode [u8]) -> Result<AgentExpressionResult<'bytecode>> {
+#[cfg(feature = "alloc")]
+pub fn evaluate<'bc>(bytecode: &'bc [u8]) -> Result<AgentExpressionResult<'bc, 'static>> {
     evaluate_internal(StateMachine::new(bytecode))
 }
 
 /// An evaluation which can be resumed once the required register value is provided.
 #[derive(Debug)]
-pub struct AgentExpressionNeedsRegister<'bytecode> {
-    state: StateMachine<'bytecode>,
+pub struct AgentExpressionNeedsRegister<'bc, 's> {
+    state: StateMachine<'bc, 's>,
 }
 
-impl<'bytecode> AgentExpressionNeedsRegister<'bytecode> {
+impl<'bc, 's> AgentExpressionNeedsRegister<'bc, 's> {
     /// Resume the evaluation with the provided `register_value`.
     pub fn resume_with_register(
         self,
         register_value: Value,
-    ) -> Result<AgentExpressionResult<'bytecode>> {
+    ) -> Result<AgentExpressionResult<'bc, 's>> {
         let mut state = self.state;
-        state.push(register_value).unwrap();
+        state.push(register_value)?;
         evaluate_internal(state)
     }
 }
 
 /// An evaluation which can be resumed once the required memory value is provided.
 #[derive(Debug)]
-pub struct AgentExpressionNeedsMemory<'bytecode> {
-    state: StateMachine<'bytecode>,
+pub struct AgentExpressionNeedsMemory<'bc, 's> {
+    state: StateMachine<'bc, 's>,
 }
 
-impl<'bytecode> AgentExpressionNeedsMemory<'bytecode> {
+impl<'bc, 's> AgentExpressionNeedsMemory<'bc, 's> {
     /// Resume the evaluation with the provided `memory_value`.
-    pub fn resume_with_memory(
-        self,
-        memory_value: Value,
-    ) -> Result<AgentExpressionResult<'bytecode>> {
+    pub fn resume_with_memory(self, memory_value: Value) -> Result<AgentExpressionResult<'bc, 's>> {
         let mut state = self.state;
-        state.push(memory_value).unwrap();
+        state.push(memory_value)?;
         evaluate_internal(state)
     }
 }
@@ -487,13 +504,13 @@ impl<'bytecode> AgentExpressionNeedsMemory<'bytecode> {
 /// which case the value can be retrieved, or it may require additional
 /// processing.
 #[derive(Debug)]
-pub enum AgentExpressionResult<'bytecode> {
+pub enum AgentExpressionResult<'bc, 's> {
     /// The agent expression needs a register value to continue evaluation.
     NeedsRegister {
         /// The register needed, according to the gdb numbering scheme.
         register: u16,
         /// The expression object to resume.
-        expression: AgentExpressionNeedsRegister<'bytecode>,
+        expression: AgentExpressionNeedsRegister<'bc, 's>,
     },
     /// The agent expression needs a memory value to continue evaluation.
     NeedsMemory {
@@ -502,14 +519,15 @@ pub enum AgentExpressionResult<'bytecode> {
         /// The size (in bytes) of the memory value needed.
         size: u8,
         /// The expression object to resume.
-        expression: AgentExpressionNeedsMemory<'bytecode>,
+        expression: AgentExpressionNeedsMemory<'bc, 's>,
     },
     /// The agent expression evaluation is complete and produced a value.
     Complete(Value),
 }
 
-impl<'bytecode> AgentExpressionResult<'bytecode> {
+impl<'bc, 's> AgentExpressionResult<'bc, 's> {
     /// Unwrap the result, panicking if it is not `Complete`.
+    #[allow(clippy::panic)]
     pub fn unwrap(self) -> Value {
         match self {
             AgentExpressionResult::NeedsRegister { .. }
@@ -521,272 +539,334 @@ impl<'bytecode> AgentExpressionResult<'bytecode> {
     }
 }
 
-#[test]
-fn test_end() {
-    let bytecode: Vec<u8> = vec![Opcode::OpEnd as u8];
-    let result = evaluate(&bytecode);
-    assert!(result.is_err());
+/// Wraps a ManagedSlice in a vec-like interface.
+#[derive(Debug)]
+struct ManagedVec<'a, T> {
+    buf: ManagedSlice<'a, T>,
+    len: usize,
 }
 
-#[test]
-fn test_const8() {
-    let bytecode: Vec<u8> = vec![Opcode::OpConst8 as u8, 0x80, Opcode::OpEnd as u8];
-    let result = evaluate(&bytecode);
-    assert!(result.is_ok());
-    let result = result.unwrap();
-    assert_eq!(result.unwrap(), Value(0x80));
-}
+impl<'a, T> ManagedVec<'a, T> {
+    fn new(buf: ManagedSlice<'a, T>) -> Self {
+        ManagedVec { buf, len: 0 }
+    }
 
-#[test]
-fn test_const16() {
-    let bytecode: Vec<u8> = vec![Opcode::OpConst16 as u8, 0x80, 0x80, Opcode::OpEnd as u8];
-    let result = evaluate(&bytecode);
-    assert!(result.is_ok());
-    let result = result.unwrap();
-    assert_eq!(result.unwrap(), Value(0x8080));
-}
-
-#[test]
-fn test_const32() {
-    let bytecode: Vec<u8> = vec![
-        Opcode::OpConst32 as u8,
-        0xde,
-        0xad,
-        0xbe,
-        0xef,
-        Opcode::OpEnd as u8,
-    ];
-    let result = evaluate(&bytecode);
-    assert!(result.is_ok());
-    let result = result.unwrap();
-    assert_eq!(result.unwrap(), Value(0xdeadbeef));
-}
-
-#[test]
-fn test_const64() {
-    let bytecode: Vec<u8> = vec![
-        Opcode::OpConst64 as u8,
-        0x5a,
-        0x5a,
-        0x5a,
-        0x5a,
-        0x5a,
-        0x5a,
-        0x5a,
-        0x5a,
-        Opcode::OpEnd as u8,
-    ];
-    let result = evaluate(&bytecode);
-    assert!(result.is_ok());
-    let result = result.unwrap();
-    assert_eq!(result.unwrap(), Value(0x5a5a5a5a5a5a5a5a));
-}
-
-#[test]
-fn test_add() {
-    let bytecode: Vec<u8> = vec![
-        Opcode::OpConst8 as u8,
-        0x80,
-        Opcode::OpConst8 as u8,
-        0x80,
-        Opcode::OpAdd as u8,
-        Opcode::OpEnd as u8,
-    ];
-    let result = evaluate(&bytecode);
-    assert!(result.is_ok());
-    let result = result.unwrap();
-    assert_eq!(result.unwrap(), Value(0x100));
-}
-
-#[test]
-fn test_add_ovf() {
-    let bytecode: Vec<u8> = vec![
-        Opcode::OpConst8 as u8,
-        0x0,
-        Opcode::OpConst64 as u8,
-        0xff,
-        0xff,
-        0xff,
-        0xff,
-        0xff,
-        0xff,
-        0xff,
-        0xff,
-        Opcode::OpAdd as u8,
-        Opcode::OpEnd as u8,
-    ];
-    let result = evaluate(&bytecode);
-    assert!(result.is_ok());
-    let result = result.unwrap();
-    assert_eq!(result.unwrap(), Value(-1));
-}
-
-#[test]
-fn test_sub() {
-    let bytecode: Vec<u8> = vec![
-        Opcode::OpConst8 as u8,
-        0x80,
-        Opcode::OpConst8 as u8,
-        0x7f,
-        Opcode::OpSub as u8,
-        Opcode::OpEnd as u8,
-    ];
-    let result = evaluate(&bytecode);
-    assert!(result.is_ok());
-    let result = result.unwrap();
-    assert_eq!(result.unwrap(), Value(1));
-}
-
-#[test]
-fn test_sub_ovf() {
-    let bytecode: Vec<u8> = vec![
-        Opcode::OpConst8 as u8,
-        0x0,
-        Opcode::OpConst64 as u8,
-        0xff,
-        0xff,
-        0xff,
-        0xff,
-        0xff,
-        0xff,
-        0xff,
-        0xff,
-        Opcode::OpSub as u8,
-        Opcode::OpEnd as u8,
-    ];
-    let result = evaluate(&bytecode);
-    assert!(result.is_ok());
-    let result = result.unwrap();
-    assert_eq!(result.unwrap(), Value(1));
-}
-
-#[test]
-fn test_mul() {
-    let bytecode: Vec<u8> = vec![
-        Opcode::OpConst8 as u8,
-        3,
-        Opcode::OpConst8 as u8,
-        8,
-        Opcode::OpMul as u8,
-        Opcode::OpEnd as u8,
-    ];
-    let result = evaluate(&bytecode);
-    assert!(result.is_ok());
-    let result = result.unwrap();
-    assert_eq!(result.unwrap(), Value(24));
-}
-
-#[test]
-fn test_lsh() {
-    let bytecode: Vec<u8> = vec![
-        Opcode::OpConst8 as u8,
-        3,
-        Opcode::OpConst8 as u8,
-        3,
-        Opcode::OpLsh as u8,
-        Opcode::OpEnd as u8,
-    ];
-    let result = evaluate(&bytecode);
-    assert!(result.is_ok());
-    let result = result.unwrap();
-    assert_eq!(result.unwrap(), Value(24));
-}
-
-#[test]
-fn test_rsh_unsigned() {
-    let bytecode: Vec<u8> = vec![
-        Opcode::OpConst8 as u8,
-        24,
-        Opcode::OpConst8 as u8,
-        3,
-        Opcode::OpRshUnsigned as u8,
-        Opcode::OpEnd as u8,
-    ];
-    let result = evaluate(&bytecode);
-    assert!(result.is_ok());
-    let result = result.unwrap();
-    assert_eq!(result.unwrap(), Value(3));
-}
-
-#[test]
-fn test_ext() {
-    let bytecode: Vec<u8> = vec![
-        Opcode::OpConst8 as u8,
-        0x8,
-        Opcode::OpExt as u8,
-        0x4,
-        Opcode::OpEnd as u8,
-    ];
-    let result = evaluate(&bytecode);
-    assert!(result.is_ok());
-    let result = result.unwrap();
-    assert_eq!(result.unwrap(), Value(-8));
-}
-
-#[test]
-fn test_rsh_signed() {
-    let bytecode: Vec<u8> = vec![
-        Opcode::OpConst8 as u8,
-        8,
-        Opcode::OpExt as u8,
-        4,
-        Opcode::OpConst8 as u8,
-        1,
-        Opcode::OpRshSigned as u8,
-        Opcode::OpEnd as u8,
-    ];
-    let result = evaluate(&bytecode);
-    assert!(result.is_ok());
-    let result = result.unwrap();
-    assert_eq!(result.unwrap(), Value(-4));
-}
-
-#[test]
-fn test_reg() {
-    let bytecode: Vec<u8> = vec![Opcode::OpReg as u8, 0, 16, Opcode::OpEnd as u8];
-    let result = evaluate(&bytecode);
-    assert!(result.is_ok());
-    let result = result.unwrap();
-    let result = match result {
-        AgentExpressionResult::NeedsRegister {
-            register,
-            expression,
-        } => {
-            assert_eq!(register, 16);
-            expression.resume_with_register(Value(512))
+    fn push(&mut self, value: T) -> core::result::Result<(), T> {
+        if self.len < self.buf.len() {
+            self.buf[self.len] = value;
+            self.len += 1;
+            Ok(())
+        } else {
+            match &mut self.buf {
+                ManagedSlice::Borrowed(_) => Err(value),
+                #[cfg(feature = "alloc")]
+                ManagedSlice::Owned(buf) => {
+                    self.len += 1;
+                    buf.push(value);
+                    Ok(())
+                }
+            }
         }
-        _ => panic!(),
-    };
-    let result = result.unwrap();
-    assert_eq!(result.unwrap(), Value(512));
+    }
+
+    fn pop(&mut self) -> Option<T>
+    where
+        T: Copy,
+    {
+        if self.len == 0 || self.buf.is_empty() {
+            return None;
+        }
+        self.len -= 1;
+
+        match &mut self.buf {
+            ManagedSlice::Borrowed(buf) => Some(buf[self.len]),
+            #[cfg(feature = "alloc")]
+            ManagedSlice::Owned(buf) => buf.pop(),
+        }
+    }
 }
 
-#[test]
-fn test_mem() {
-    let bytecode: Vec<u8> = vec![
-        Opcode::OpConst32 as u8,
-        0xde,
-        0xad,
-        0xbe,
-        0xef,
-        Opcode::OpRef32 as u8,
-        Opcode::OpEnd as u8,
-    ];
-    let result = evaluate(&bytecode);
-    assert!(result.is_ok());
-    let result = result.unwrap();
-    let result = match result {
-        AgentExpressionResult::NeedsMemory {
-            address,
-            size,
-            expression,
-        } => {
-            assert_eq!(address, Value(0xdeadbeef));
-            assert_eq!(size, 4);
-            expression.resume_with_memory(Value(512))
-        }
-        _ => panic!(),
-    };
-    let result = result.unwrap();
-    assert_eq!(result.unwrap(), Value(512));
+impl<'a, T> core::ops::Deref for ManagedVec<'a, T> {
+    type Target = [T];
+
+    fn deref(&self) -> &Self::Target {
+        &self.buf
+    }
+}
+
+#[cfg(all(test, feature = "std"))]
+mod tests {
+    #![allow(clippy::panic)]
+
+    use super::*;
+
+    #[test]
+    fn test_end() {
+        let bytecode = vec![Opcode::OpEnd as u8];
+        let result = evaluate(&bytecode);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_const8() {
+        let bytecode = vec![Opcode::OpConst8 as u8, 0x80, Opcode::OpEnd as u8];
+        let result = evaluate(&bytecode);
+        assert!(result.is_ok());
+        let result = result.unwrap();
+        assert_eq!(result.unwrap(), Value(0x80));
+    }
+
+    #[test]
+    fn test_const16() {
+        let bytecode = vec![Opcode::OpConst16 as u8, 0x80, 0x80, Opcode::OpEnd as u8];
+        let result = evaluate(&bytecode);
+        assert!(result.is_ok());
+        let result = result.unwrap();
+        assert_eq!(result.unwrap(), Value(0x8080));
+    }
+
+    #[test]
+    fn test_const32() {
+        let bytecode = vec![
+            Opcode::OpConst32 as u8,
+            0xde,
+            0xad,
+            0xbe,
+            0xef,
+            Opcode::OpEnd as u8,
+        ];
+        let result = evaluate(&bytecode);
+        assert!(result.is_ok());
+        let result = result.unwrap();
+        assert_eq!(result.unwrap(), Value(0xdeadbeef));
+    }
+
+    #[test]
+    fn test_const64() {
+        let bytecode = vec![
+            Opcode::OpConst64 as u8,
+            0x5a,
+            0x5a,
+            0x5a,
+            0x5a,
+            0x5a,
+            0x5a,
+            0x5a,
+            0x5a,
+            Opcode::OpEnd as u8,
+        ];
+        let result = evaluate(&bytecode);
+        assert!(result.is_ok());
+        let result = result.unwrap();
+        assert_eq!(result.unwrap(), Value(0x5a5a5a5a5a5a5a5a));
+    }
+
+    #[test]
+    fn test_add() {
+        let bytecode = vec![
+            Opcode::OpConst8 as u8,
+            0x80,
+            Opcode::OpConst8 as u8,
+            0x80,
+            Opcode::OpAdd as u8,
+            Opcode::OpEnd as u8,
+        ];
+        let result = evaluate(&bytecode);
+        assert!(result.is_ok());
+        let result = result.unwrap();
+        assert_eq!(result.unwrap(), Value(0x100));
+    }
+
+    #[test]
+    fn test_add_ovf() {
+        let bytecode = vec![
+            Opcode::OpConst8 as u8,
+            0x0,
+            Opcode::OpConst64 as u8,
+            0xff,
+            0xff,
+            0xff,
+            0xff,
+            0xff,
+            0xff,
+            0xff,
+            0xff,
+            Opcode::OpAdd as u8,
+            Opcode::OpEnd as u8,
+        ];
+        let result = evaluate(&bytecode);
+        assert!(result.is_ok());
+        let result = result.unwrap();
+        assert_eq!(result.unwrap(), Value(-1));
+    }
+
+    #[test]
+    fn test_sub() {
+        let bytecode = vec![
+            Opcode::OpConst8 as u8,
+            0x80,
+            Opcode::OpConst8 as u8,
+            0x7f,
+            Opcode::OpSub as u8,
+            Opcode::OpEnd as u8,
+        ];
+        let result = evaluate(&bytecode);
+        assert!(result.is_ok());
+        let result = result.unwrap();
+        assert_eq!(result.unwrap(), Value(1));
+    }
+
+    #[test]
+    fn test_sub_ovf() {
+        let bytecode = vec![
+            Opcode::OpConst8 as u8,
+            0x0,
+            Opcode::OpConst64 as u8,
+            0xff,
+            0xff,
+            0xff,
+            0xff,
+            0xff,
+            0xff,
+            0xff,
+            0xff,
+            Opcode::OpSub as u8,
+            Opcode::OpEnd as u8,
+        ];
+        let result = evaluate(&bytecode);
+        assert!(result.is_ok());
+        let result = result.unwrap();
+        assert_eq!(result.unwrap(), Value(1));
+    }
+
+    #[test]
+    fn test_mul() {
+        let bytecode = vec![
+            Opcode::OpConst8 as u8,
+            3,
+            Opcode::OpConst8 as u8,
+            8,
+            Opcode::OpMul as u8,
+            Opcode::OpEnd as u8,
+        ];
+        let result = evaluate(&bytecode);
+        assert!(result.is_ok());
+        let result = result.unwrap();
+        assert_eq!(result.unwrap(), Value(24));
+    }
+
+    #[test]
+    fn test_lsh() {
+        let bytecode = vec![
+            Opcode::OpConst8 as u8,
+            3,
+            Opcode::OpConst8 as u8,
+            3,
+            Opcode::OpLsh as u8,
+            Opcode::OpEnd as u8,
+        ];
+        let result = evaluate(&bytecode);
+        assert!(result.is_ok());
+        let result = result.unwrap();
+        assert_eq!(result.unwrap(), Value(24));
+    }
+
+    #[test]
+    fn test_rsh_unsigned() {
+        let bytecode = vec![
+            Opcode::OpConst8 as u8,
+            24,
+            Opcode::OpConst8 as u8,
+            3,
+            Opcode::OpRshUnsigned as u8,
+            Opcode::OpEnd as u8,
+        ];
+        let result = evaluate(&bytecode);
+        assert!(result.is_ok());
+        let result = result.unwrap();
+        assert_eq!(result.unwrap(), Value(3));
+    }
+
+    #[test]
+    fn test_ext() {
+        let bytecode = vec![
+            Opcode::OpConst8 as u8,
+            0x8,
+            Opcode::OpExt as u8,
+            0x4,
+            Opcode::OpEnd as u8,
+        ];
+        let result = evaluate(&bytecode);
+        assert!(result.is_ok());
+        let result = result.unwrap();
+        assert_eq!(result.unwrap(), Value(-8));
+    }
+
+    #[test]
+    fn test_rsh_signed() {
+        let bytecode = vec![
+            Opcode::OpConst8 as u8,
+            8,
+            Opcode::OpExt as u8,
+            4,
+            Opcode::OpConst8 as u8,
+            1,
+            Opcode::OpRshSigned as u8,
+            Opcode::OpEnd as u8,
+        ];
+        let result = evaluate(&bytecode);
+        assert!(result.is_ok());
+        let result = result.unwrap();
+        assert_eq!(result.unwrap(), Value(-4));
+    }
+
+    #[test]
+    fn test_reg() {
+        let bytecode = vec![Opcode::OpReg as u8, 0, 16, Opcode::OpEnd as u8];
+        let result = evaluate(&bytecode);
+        assert!(result.is_ok());
+        let result = result.unwrap();
+        let result = match result {
+            AgentExpressionResult::NeedsRegister {
+                register,
+                expression,
+            } => {
+                assert_eq!(register, 16);
+                expression.resume_with_register(Value(512))
+            }
+            _ => panic!(),
+        };
+        let result = result.unwrap();
+        assert_eq!(result.unwrap(), Value(512));
+    }
+
+    #[test]
+    fn test_mem() {
+        let bytecode = vec![
+            Opcode::OpConst32 as u8,
+            0xde,
+            0xad,
+            0xbe,
+            0xef,
+            Opcode::OpRef32 as u8,
+            Opcode::OpEnd as u8,
+        ];
+        let result = evaluate(&bytecode);
+        assert!(result.is_ok());
+        let result = result.unwrap();
+        let result = match result {
+            AgentExpressionResult::NeedsMemory {
+                address,
+                size,
+                expression,
+            } => {
+                assert_eq!(address, Value(0xdeadbeef));
+                assert_eq!(size, 4);
+                expression.resume_with_memory(Value(512))
+            }
+            _ => panic!(),
+        };
+        let result = result.unwrap();
+        assert_eq!(result.unwrap(), Value(512));
+    }
 }
