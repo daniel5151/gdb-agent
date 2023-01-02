@@ -1,8 +1,8 @@
 [package]
 name = "gdb-agent"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2018"
-authors = ["Kyle Huey <khuey@kylehuey.com>"]
+authors = ["Kyle Huey <khuey@kylehuey.com>", "Daniel Prilik <daniel@prilik.com>"]
 license = "Apache-2.0/MIT"
 repository = "https://github.com/khuey/gdb-agent"
 description = "Gdb agent bytecode handling utilities."
