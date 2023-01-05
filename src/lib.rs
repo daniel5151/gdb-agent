@@ -424,33 +424,26 @@ impl<'bc, 's> StateMachine<'bc, 's> {
 
         Ok(State::Continue)
     }
-
-    fn evaluate(&mut self) -> Result<State> {
-        loop {
-            match self.step()? {
-                State::Continue => continue,
-                x => return Ok(x),
-            }
-        }
-    }
 }
 
 fn evaluate_internal<'bc, 's>(
     mut state: StateMachine<'bc, 's>,
 ) -> Result<AgentExpressionResult<'bc, 's>> {
-    Ok(match state.evaluate()? {
-        State::Complete(v) => AgentExpressionResult::Complete(v),
-        State::NeedsRegister(r) => AgentExpressionResult::NeedsRegister {
-            register: r,
-            expression: AgentExpressionNeedsRegister { state },
-        },
-        State::NeedsMemory { address, size } => AgentExpressionResult::NeedsMemory {
-            address,
-            size,
-            expression: AgentExpressionNeedsMemory { state },
-        },
-        State::Continue => unreachable!(),
-    })
+    loop {
+        return Ok(match state.step()? {
+            State::Continue => continue,
+            State::Complete(v) => AgentExpressionResult::Complete(v),
+            State::NeedsRegister(r) => AgentExpressionResult::NeedsRegister {
+                register: r,
+                expression: AgentExpressionNeedsRegister { state },
+            },
+            State::NeedsMemory { address, size } => AgentExpressionResult::NeedsMemory {
+                address,
+                size,
+                expression: AgentExpressionNeedsMemory { state },
+            },
+        });
+    }
 }
 
 /// Evaluate an agent bytecode expression, using a pre-allocated fixed-size stack.
